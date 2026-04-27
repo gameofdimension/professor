@@ -152,6 +152,76 @@ print("OK — FlexAttention 内核零改动，PagedAttention 语义在 Python �
 
 ---
 
+## 为什么必须替换 `block_mask` 的 `kv_indices`
+
+### `create_block_mask` 在哪个地址空间工作
+
+`create_block_mask` 内部把 KV 序列**均匀切块**（默认 block size 128），然后对每个
+`(query block, kv block)` 对调用 `mask_mod` 采样，判断该对块是否整体有效。
+它输出的 `kv_indices[b, h, q_block, :]` 保存的是"该 query block 需要关注的 KV
+**块号**列表"——这个块号是在**被调用时传入的 `KV_LEN` 所定义的连续空间**内的
+顺序编号（第 0 块、第 1 块……）。
+
+在本方案中我们传入 `KV_LEN = N_PAGES * PAGE_SIZE`，因此 `create_block_mask`
+将整个物理 KV 空间视作一段**从 0 开始连续排列**的地址，输出的块号也是
+从 0 开始的**连续块序号**。
+
+### 问题：连续块序号 ≠ 物理页号
+
+`flex_attention` 运行时会直接把 `kv_indices` 中的值乘以 `BLOCK_SIZE`，当作物理
+KV 张量上的起始偏移来加载数据：
+
+```
+# flex_attention 内部等效行为
+block_start = kv_indices[b, h, q_block, k] * BLOCK_SIZE
+load kv_cache[b, h, block_start : block_start + BLOCK_SIZE, :]
+```
+
+但在 PagedAttention 中，"逻辑块 1"的数据可能实际存储在物理页 4，
+"逻辑块 2"的数据存储在物理页 7——**顺序块序号 ≠ 物理页号**。
+若不替换，`flex_attention` 会去错误的物理位置取数据。
+
+### 具体示例
+
+以 `page_size=2`、batch-0 的页表 `[0, 2, 4]` 为例：
+
+| 逻辑块 | create_block_mask 输出的块号 | 实际物理页号 |
+|--------|------------------------------|--------------|
+| 0      | 0                            | 0 ✓ (恰好相同) |
+| 1      | 1                            | 2 ✗ (差 1 页) |
+| 2      | 2                            | 4 ✗ (差 2 页) |
+
+若不替换，块号 1 会被当作物理页 1（属于 batch-1），块号 2 会被当作物理页 2
+（batch-0 的逻辑块 1），计算结果完全错误。
+
+### 修复：用页表做一次 gather
+
+```python
+# kv_indices 当前是连续块序号（逻辑块号）
+kv_idx_flat = block_mask.kv_indices.view(B_, -1)
+
+# 用页表把逻辑块号映射到物理页号
+phys_kv_idx = torch.gather(
+    page_table[:, :kv_idx_flat.max().item() + 1],
+    1,
+    kv_idx_flat.clamp(min=0),
+).view(B_, H_, Qb, Kb)
+
+block_mask = block_mask._replace(kv_indices=phys_kv_idx)
+```
+
+`torch.gather` 的语义是 `phys_kv_idx[b, i] = page_table[b, kv_idx_flat[b, i]]`，
+即把每个逻辑块号查表换成对应的物理页号。替换后，`flex_attention` 拿着物理页号
+去物理 KV 张量取数据，结果才是正确的。
+
+### 一句话总结
+
+> `create_block_mask` 输出的是**连续地址空间中的块序号（逻辑块号）**；
+> `flex_attention` 需要的是**物理 KV 张量上的实际块偏移（物理页号）**。
+> PagedAttention 的核心就是两者不一致，所以必须用页表做一次显式转换。
+
+---
+
 ## 适用场景与局限
 
 **适用**：
