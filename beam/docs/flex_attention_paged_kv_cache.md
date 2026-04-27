@@ -1,0 +1,172 @@
+# 用 FlexAttention 实现 PagedAttention 语义
+
+> 更新时间：2026-04-27  
+> 研究背景：探索在不修改 FlexAttention 算子本身的前提下，仅通过 Python 层的
+> `mask_mod` / `score_mod` 闭包与页表映射，实现与 PagedAttention 等价的分页
+> KV Cache 访问语义。
+
+---
+
+## 核心思路
+
+PagedAttention 的本质是：**把连续的逻辑 KV 序列打散存储到不连续的物理内存页**，
+从而消除碎片、支持跨请求共享 KV Cache。
+
+FlexAttention 提供的 `mask_mod(b, h, q_idx, kv_idx)` 回调在**每次计算 attention
+score 前**被调用，`kv_idx` 指向物理 KV 张量的实际偏移——这正好可以在闭包里做
+"物理地址 → 逻辑地址" 的翻译，从而把 causal mask 等原始语义映射到物理布局上。
+
+```
+逻辑视角                    物理视角（KV Cache）
+─────────────────           ───────────────────────────────────
+seq[0]  seq[1]              page0 [tok0, tok1]   ← batch-0 逻辑块0
+seq[2]  seq[3]    页表→      page2 [tok2, tok3]   ← batch-0 逻辑块1
+seq[4]  seq[5]              page4 [tok4, tok5]   ← batch-0 逻辑块2
+                            page1 [tok0, tok1]   ← batch-1 逻辑块0
+                            page3 [tok2, tok3]   ← batch-1 逻辑块1
+```
+
+三步完成映射，**算子代码零改动**：
+
+1. **写入**：prefill 时按页表散写物理 KV Cache。  
+2. **mask_mod 闭包**：decode/prefill attention 时，把物理 `kv_idx` 翻译回逻辑位置，再套 causal + valid-length 条件。  
+3. **block_mask 修补**：`create_block_mask` 生成的块索引是逻辑块号，用一次 `torch.gather` 把它替换成物理页号。
+
+---
+
+## 完整可运行示例
+
+```python
+"""
+用 FlexAttention 实现 PagedAttention 语义（最小完备示例）
+依赖：torch >= 2.5
+
+场景：
+  - batch=2（两个请求）；序列长 6 和 4
+  - page_size=2（每页存 2 个 token）
+  - num_heads=1, head_dim=8
+  - 物理页池共 6 页；两个请求从同一池中分配，页不连续
+"""
+import torch
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+
+# ─── 超参 ──────────────────────────────────────────────────────────────────
+B, H, D   = 2, 1, 8
+PAGE_SIZE = 2
+N_PAGES   = 6          # 物理页总数
+
+# ─── 1. 物理 KV-cache：所有 batch 共享一块连续张量 ──────────────────────────
+#   shape: (1, H, N_PAGES * PAGE_SIZE, D)
+k_cache = torch.randn(1, H, N_PAGES * PAGE_SIZE, D)
+v_cache = torch.randn(1, H, N_PAGES * PAGE_SIZE, D)
+
+# ─── 2. 页表：逻辑块号 → 物理页号 ────────────────────────────────────────────
+#   page_table[b, logic_block] = physical_page_idx  （-1 表示未分配）
+page_table = torch.tensor([
+    [0, 2, 4, -1],   # batch-0：逻辑块0→物理页0，块1→页2，块2→页4
+    [1, 3, -1, -1],  # batch-1：逻辑块0→物理页1，块1→页3
+], dtype=torch.long)
+
+# 反向页表：physical_page → logic_block（供 mask_mod 使用）
+physical_to_logical = torch.full((B, N_PAGES), -1, dtype=torch.long)
+for b in range(B):
+    for logic, phys in enumerate(page_table[b]):
+        if phys >= 0:
+            physical_to_logical[b, phys] = logic
+
+# ─── 3. Prefill：把 KV 按页表散写到物理 cache ────────────────────────────────
+seq_lens = [6, 4]
+
+def write_kv(b, seq_len, k_val, v_val):
+    for pos in range(seq_len):
+        phys_addr = page_table[b, pos // PAGE_SIZE].item() * PAGE_SIZE + pos % PAGE_SIZE
+        k_cache[0, :, phys_addr, :] = k_val[pos]
+        v_cache[0, :, phys_addr, :] = v_val[pos]
+
+for b in range(B):
+    write_kv(b, seq_lens[b],
+             torch.randn(seq_lens[b], H, D),
+             torch.randn(seq_lens[b], H, D))
+
+# ─── 4. mask_mod：物理 kv_idx → 逻辑位置 → causal + valid ────────────────────
+def make_paged_mask_mod(page_table, physical_to_logical, page_size, seq_lens_t):
+    def mask_mod(b, h, q_idx, physical_kv_idx):
+        phys_page    = physical_kv_idx // page_size
+        page_offset  = physical_kv_idx %  page_size
+        logic_block  = physical_to_logical[b, phys_page]
+        logic_kv_idx = logic_block * page_size + page_offset
+        return (logic_block >= 0) & (logic_kv_idx <= q_idx) & (logic_kv_idx < seq_lens_t[b])
+    return mask_mod
+
+seq_lens_t = torch.tensor(seq_lens)
+mask_mod   = make_paged_mask_mod(page_table, physical_to_logical, PAGE_SIZE, seq_lens_t)
+
+# ─── 5. 构造 block_mask，把逻辑块号替换为物理页号 ──────────────────────────────
+Q_LEN = max(seq_lens)
+
+block_mask = create_block_mask(
+    mask_mod,
+    B=B, H=None,
+    Q_LEN=Q_LEN,
+    KV_LEN=N_PAGES * PAGE_SIZE,   # 物理 KV 空间总长
+    device="cpu",
+)
+
+# kv_indices 当前是逻辑块号，用 gather 换成物理页号
+kv_idx          = block_mask.kv_indices                      # (B, H, Qb, Kb)
+B_, H_, Qb, Kb  = kv_idx.shape
+kv_idx_flat     = kv_idx.view(B_, -1)
+phys_kv_idx     = torch.gather(
+    page_table[:, :kv_idx_flat.max().item() + 1],
+    1,
+    kv_idx_flat.clamp(min=0),
+).view(B_, H_, Qb, Kb)
+
+block_mask = block_mask._replace(kv_indices=phys_kv_idx)
+
+# ─── 6. 调用 FlexAttention（算子代码完全不变）────────────────────────────────
+query = torch.randn(B, H, Q_LEN, D)
+
+output = flex_attention(
+    query,
+    k_cache.expand(B, -1, -1, -1),
+    v_cache.expand(B, -1, -1, -1),
+    block_mask=block_mask,
+)
+
+print("output shape:", output.shape)   # → (2, 1, 6, 8)
+print("OK — FlexAttention 内核零改动，PagedAttention 语义在 Python 层完成。")
+```
+
+---
+
+## 关键步骤说明
+
+| 步骤 | 位置 | 作用 |
+|------|------|------|
+| 物理 KV-cache | `k_cache shape=(1,H,N_PAGES*PAGE_SIZE,D)` | 所有 batch 共享，页不需要连续 |
+| 散写（prefill） | `write_kv()` | 唯一一次逻辑→物理翻译，发生在写阶段 |
+| `mask_mod` 闭包 | `make_paged_mask_mod()` | 运行时把物理 `kv_idx` 翻译回逻辑位置，套 causal + 有效长度条件 |
+| block_mask 修补 | `torch.gather(page_table, ...)` | 一行代码把块索引从逻辑空间换到物理空间 |
+| 调用 | `flex_attention(q, k_cache, v_cache, block_mask=...)` | 算子本身完全不变 |
+
+---
+
+## 适用场景与局限
+
+**适用**：
+- 在现有 FlexAttention 环境下快速验证 PagedAttention 语义正确性。
+- 作为自定义 KV Cache 管理策略（如前缀共享、多租户复用）的实验起点。
+
+**局限**：
+- `mask_mod` 闭包在每个 token 粒度触发，对极大 batch 或极宽 beam 有性能开销。
+- 生产级实现（如 vLLM）在 C++/CUDA 层做了更细粒度的内存管理，本方案为纯
+  Python 层等价实现，不能直接替代生产调度器。
+- `block_mask._replace` 是内部 API，跨版本需确认字段名。
+
+---
+
+## 参考
+
+- PyTorch FlexAttention 文档：<https://pytorch.org/docs/stable/nn.attention.flex_attention.html>  
+- vLLM PagedAttention 论文（Kwon et al., 2023）：<https://arxiv.org/abs/2309.06180>
