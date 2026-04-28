@@ -253,6 +253,92 @@ block_mask = block_mask._replace(kv_indices=phys_kv_idx)
 
 ---
 
+## attention-gym 的生产级实现
+
+[attention-gym](https://github.com/meta-pytorch/attention-gym) 的
+`attn_gym/paged_attention/paged_attention.py` 提供了一个完整的 `PagedAttention`
+类，其 `convert_logical_block_mask()` 方法正是上述 gather 思路的生产级版本。
+与本文极简示例相比，它有以下几处关键差异：
+
+### 1. 显式断言 `page_size == BLOCK_SIZE`
+
+```python
+if block_mask.BLOCK_SIZE[1] != self.page_size:
+    raise RuntimeError(
+        f"Expect block_mask has the same column block size as page_size"
+        f"but got size={block_mask.BLOCK_SIZE[1]} and size={self.page_size}"
+    )
+```
+
+attention-gym **主动校验**这一约束，违反时立即报错，而不是让错误的物理地址悄悄
+滑入计算。
+
+### 2. `new_kv_indices` 列数扩展到 `n_pages`
+
+```python
+new_kv_indices = torch.zeros((B, H, ROWS, self.n_pages), dtype=torch.int32, device=device)
+new_kv_indices[:, :, :, :MAX_BLOCKS_IN_COL] = (
+    torch.gather(page_table, 1, block_mask.kv_indices.view(B, -1).to(torch.int64))
+    .view(block_mask.kv_indices.shape)
+    .to(torch.int32)
+)
+```
+
+逻辑块号的最大值是 `MAX_BLOCKS_IN_COL - 1`，物理页号的最大值则可达
+`n_pages - 1`（远大于前者）。若直接在原始形状上替换，`_ordered_to_dense`
+等内部函数访问索引时会越界。attention-gym 将列维度预先扩展到 `n_pages`，
+再把 gather 结果填入前 `MAX_BLOCKS_IN_COL` 列，其余保持 0（永不被访问）。
+
+本文示例在 CPU 上因 `BLOCK_SIZE=1`、`n_pages` 极小而未触发越界，生产环境必须
+按此处理。
+
+### 3. 同步替换 `full_kv_indices`
+
+`BlockMask` 除 `kv_indices`（稀疏块）外还有 `full_kv_indices`（整块参与
+attention 的块）。attention-gym 用同一 gather 逻辑对两者同时做物理化：
+
+```python
+if block_mask.full_kv_num_blocks is not None:
+    new_full_kv_indices[:, :, :, :MAX_BLOCKS_IN_COL] = (
+        torch.gather(page_table, 1, block_mask.full_kv_indices.view(B, -1).to(torch.int64))
+        .view(block_mask.full_kv_indices.shape)
+        .to(torch.int32)
+    )
+```
+
+若只替换 `kv_indices` 而忽略 `full_kv_indices`，全块路径仍会走到错误物理地址。
+
+### 4. 用 `BlockMask.from_kv_blocks()` 构造新对象
+
+attention-gym 不依赖内部 `_replace` API，而是用公开的工厂方法：
+
+```python
+return BlockMask.from_kv_blocks(
+    new_kv_num_blocks,
+    new_kv_indices,
+    new_full_kv_num_blocks,
+    new_full_kv_indices,
+    block_mask.BLOCK_SIZE,
+    new_mask_mod,
+    seq_lengths=(block_mask.seq_lengths[0], self.n_pages * self.page_size),
+)
+```
+
+同时将 `seq_lengths` 的 KV 维度从逻辑空间长度更新为物理空间总长
+`n_pages * page_size`，确保 flex_attention 的边界检查与物理张量尺寸一致。
+
+### 5. 小结：本文示例与 attention-gym 的对比
+
+| 维度 | 本文示例 | attention-gym |
+|------|----------|---------------|
+| `page_size == BLOCK_SIZE` 约束 | 隐含，CPU 下因退化而掩盖 | 显式 RuntimeError |
+| `kv_indices` 列数 | 保持原形状（小序列下侥幸不越界） | 扩展到 `n_pages` |
+| `full_kv_indices` | 未处理 | 同步 gather |
+| 构造新 BlockMask | `block_mask._replace`（内部 API） | `BlockMask.from_kv_blocks`（公开 API） |
+| `seq_lengths` KV 维度 | 未更新 | 更新为物理空间总长 |
+
+---
+
 ## 适用场景与局限
 
 **适用**：
