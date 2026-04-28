@@ -222,6 +222,37 @@ block_mask = block_mask._replace(kv_indices=phys_kv_idx)
 
 ---
 
+## `page_size` 与 `BLOCK_SIZE`：两个独立的粒度
+
+`page_size` 属于 **KV Cache 内存管理层**（每页存多少 token），`BLOCK_SIZE`
+属于 **FlexAttention 计算层**（每次计算处理多少 token）。两者概念上完全解耦——
+`mask_mod` 在单 token 粒度工作，无论 `page_size` 和 `BLOCK_SIZE` 取何值，
+逻辑翻译 `physical_kv_idx → logic_kv_idx` 始终正确。
+
+然而，上述 `gather` 技巧隐含了一个对齐约束：
+
+> `flex_attention` 内部用 `kv_indices * BLOCK_SIZE` 定位物理 KV 张量的起始偏移；
+> `page_table` 的索引单位是 `page_size`。  
+> **只有当 `page_size == BLOCK_SIZE` 时，"物理页号 × BLOCK_SIZE" 才恰好等于
+> 该页在 KV 张量上的字节偏移，`gather` 替换才是正确的。**
+
+### 为什么示例在 CPU 上不报错
+
+示例的 `KV_LEN = 12`（极短），`create_block_mask` 在 CPU 上会自动将 `BLOCK_SIZE`
+退化为 1。此时每个 token 独占一个"块"，`kv_indices` 直接是 token 级的物理地址，
+`page_size=2` 与 `BLOCK_SIZE=1` 的不一致被 `mask_mod` 的 token 级过滤掩盖，
+结果碰巧正确。若在 GPU 上以 `BLOCK_SIZE=128` 运行且 `page_size ≠ 128`，
+上述 `gather` 替换将产生错误的物理地址。
+
+### 生产级做法（二选一）
+
+| 方案 | 做法 | 适用场景 |
+|------|------|----------|
+| ① 对齐 | 令 `page_size == BLOCK_SIZE`，按 FlexAttention 的 block size 对齐分页（vLLM 的实际做法） | 需要充分利用 `block_mask` 的整块跳过优化 |
+| ② 纯 mask_mod | 不替换 `kv_indices`，完全依靠 `mask_mod` 做 token 级过滤 | `page_size` 可任意选择；代价是更多 partial block，跳过优化效果下降 |
+
+---
+
 ## 适用场景与局限
 
 **适用**：
@@ -233,6 +264,9 @@ block_mask = block_mask._replace(kv_indices=phys_kv_idx)
 - 生产级实现（如 vLLM）在 C++/CUDA 层做了更细粒度的内存管理，本方案为纯
   Python 层等价实现，不能直接替代生产调度器。
 - `block_mask._replace` 是内部 API，跨版本需确认字段名。
+- `block_mask.kv_indices` 的 `gather` 替换隐含 `page_size == BLOCK_SIZE` 约束。
+  在 CPU 小序列示例中，`BLOCK_SIZE` 自动退化为 1 掩盖了该约束；GPU 生产环境下
+  若两者不一致会产生错误结果（参见上方"`page_size` 与 `BLOCK_SIZE`"节）。
 
 ---
 
