@@ -2,15 +2,22 @@
 
 > 作者：jasl（DeepSeek V4 SM12x 后端移植与优化）
 > 涉及仓库：`vllm-project/vllm`（分支 `ds4-sm120-preview-dev`）+ 配套 `DeepGEMM-jasl`（分支 `sm120`）
-> 整理日期：2026-06-16
+> 整理日期：2026-06-16（第 8 节及关联章节已于 2026-06-16 订正）
 
-本文档梳理 jasl 为 **DeepSeek V4 在 NVIDIA Blackwell SM12x GPU 上的 vLLM 推理支持** 所做的完整工程方案：根因、总体架构、两个仓库的分工、一次前向的数据流、DeepGEMM 的角色与替代品、分支模型、使用方式与完成度评估。
+本文档梳理 jasl 为 **DeepSeek V4 在 NVIDIA Blackwell SM12x GPU 上的 vLLM 推理支持** 所做的完整工程方案：根因、总体架构、两个仓库的关系、一次前向的数据流、**DeepGEMM 在运行时的真实角色**、分支模型、使用方式与完成度评估。
+
+> **阅读提示**：经逐行追踪派发代码，本方案有一个反直觉但关键的事实——**vLLM 的 SM12x 运行路径是自包含的，运行时根本不调用 DeepGEMM-jasl fork 的任何计算内核**。DeepGEMM-jasl 是作者 4 月的可行性验证产物，5 月集成进 vLLM 时被自研 SM12x Triton/torch 取代。详见第 8 节。
 
 ---
 
 ## 1. 一句话概述
 
-把 DeepSeek V4 的推理支持从**数据中心 Blackwell（SM90/SM100，B200）**下沉到**消费/工作站/边缘 Blackwell（SM12x）**。这是一套**跨两个仓库、分两层**的方案：先给 DeepGEMM 补齐 SM12x 的张量核心原语（解除"DSv4 在 SM12x 起不来"的硬卡点），再在 vLLM 用可移植 Triton + 回退实现 + 手调配置把完整前向与服务化跑通。
+把 DeepSeek V4 的推理支持从**数据中心 Blackwell（SM90/SM100，B200）**下沉到**消费/工作站/边缘 Blackwell（SM12x）**。作者先后做了两件事：
+
+1. **DeepGEMM-jasl fork（4 月）**：给 DeepGEMM 补齐 SM12x 的张量核心原语，证明 DeepGEMM 的 CUDA 路线在 SM120 上可跑（解除"stock DeepGEMM 拒绝 SM12x"的硬卡点）。
+2. **vLLM SM12x 集成（5–6 月）**：在 vLLM 里用**自包含的 SM12x Triton/torch**实现所有原本依赖 DeepGEMM 的算子，外加可移植 sparse MLA、手调 FP8 配置、调度器加固等，把完整前向与服务化跑通。
+
+> 注意：第 2 步并未复用第 1 步的 fork 内核——vLLM 在 wrapper 层把所有 DeepGEMM 接口短路到了自己的 SM12x 实现。**fork 对 vLLM 运行时非必需**（详见 §8）。
 
 ## 2. 目标硬件
 
@@ -19,7 +26,7 @@
 | **SM120**（GB202） | RTX PRO 6000 Blackwell Workstation Edition | 工作站 |
 | **SM121**（Grace-Blackwell） | GB10（DGX Spark / Jetson Thor） | 边缘/嵌入式 |
 
-关键基础工作：把 CUDA major 12（SM120 + SM121）统一归一到 **`sm_120f` JIT target + `sm120` include 后缀**，使这两类设备共享同一套 SM12x 内核族。
+关键基础工作（在 fork 里）：把 CUDA major 12（SM120 + SM121）统一归一到 **`sm_120f` JIT target + `sm120` include 后缀**，使这两类设备共享同一套 SM12x 内核族。
 
 ## 3. 根因：为什么 SM12x 开箱跑不了 DSv4
 
@@ -34,35 +41,39 @@ DeepGEMM-jasl 的提交 `2206a1d` 把根因讲得很直白：
 
 因此 SM12x（RTX PRO 6000 Blackwell、GB10/DGX Spark）上 DSv4 根本无法启动，更谈不上服务化。
 
-## 4. 总体架构：两层 + 两仓库
+## 4. 总体架构：两个仓库、两条并行路线
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│ Repo 2: vLLM  ds4-sm120-preview-dev   （服务 / Triton 层）        │
-│   • 可移植 Triton sparse MLA 全注意力（DeepGEMM 不做的部分）       │
-│   • DeepGEMM-only 接口的 Triton/torch 回退（无 fork 也能跑）       │
-│   • 手调 FP8 配置（SM12x 专用）                                   │
-│   • kernel warmup / 调度器公平性 / MTP / reasoning parser / FP4   │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │ 调用 GEMM / MQA-logits / HC-prenorm 接口
-                            ▼
+│ vLLM  ds4-sm120-preview-dev   （SM12x 自包含服务层 —— 实际运行路径）│
+│   • 可移植 Triton sparse MLA 全注意力                              │
+│   • 所有 DeepGEMM-interface 算子的 SM12x Triton/torch 实现         │
+│     einsum → fp8_einsum.py 的 SM12x Triton                         │
+│     mqa/paged-mqa/hc → sm12x_deep_gemm_fallbacks（Triton/torch）   │
+│   • 通用 FP8 GEMM/MoE → CUTLASS(SM120)/Marlin/Triton/FlashInfer   │
+│   • 手调 FP8 配置 + warmup + 调度器公平性 + MTP + reasoning parser │
+└─────────────────────────────────────────────────────────────────┘
+              ▲ SM12x 运行时【不】向下调用 fork 的计算内核
+              │（wrapper 用 is_device_capability_family(120) 短路）
+
 ┌─────────────────────────────────────────────────────────────────┐
-│ Repo 1: DeepGEMM-jasl  sm120   （CUDA 张量核心原语层）            │
+│ DeepGEMM-jasl  sm120   （独立的 CUDA 能力 / 参考实现，4 月产物）   │
 │   • sm120 FP8 einsum / paged MQA logits / tf32 HC prenorm GEMM   │
 │   • SM120 MMA 原语（避开 SM90 WGMMA / SM100 tcgen05+TMA 假设）     │
 │   • SM12x JIT 派发启发式、sm_120f 统一 target                      │
+│   ⚠️ vLLM 的 SM12x 派发不会调用这些内核（见 §8）                    │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**设计哲学**：能复用上游算子的，用 DeepGEMM-jasl 给 SM12x 补真 CUDA 内核；DeepGEMM 没有的（完整 sparse MLA 注意力），在 vLLM 用可移植 Triton 重写；并为所有 DeepGEMM-only 接口都准备一份 Triton/torch 回退，使方案对"是否安装 DeepGEMM-jasl fork"具备鲁棒性。
+**设计哲学**：vLLM 在 SM12x 上**不依赖 DeepGEMM-jasl**——每个 DeepGEMM 接口都用 SM12x 自研 Triton/torch 实现，并在 wrapper 层短路，使方案对"是否安装 fork"完全鲁棒。DeepGEMM-jasl 则作为**独立的 DeepGEMM 能力 / 正确性与性能基准**存在，可在 vLLM 之外的 SM12x 推理栈直接使用。
 
 ---
 
 ## 5. Repo 1：DeepGEMM-jasl `sm120` 分支（CUDA 原语层）
 
-- **时间**：2026-04-24 ~ 04-26（**先于 vLLM 侧**，因为这是"能否起跑"的硬卡点）
+- **时间**：2026-04-24 ~ 04-26（**先于 vLLM 侧**，作为可行性验证）
 - **规模**：14 个提交（13 jasl + 1 ergodic-flow），约 **+2,035 行**
-- **定位**：扩展 DeepGEMM 本体，为 SM12x 补齐原本只有 SM90/SM100 实现的算子族
+- **定位**：扩展 DeepGEMM 本体，证明其 CUDA 路线可在 SM12x 跑通。**注意：这些内核不在 vLLM 的 SM12x 运行路径上（见 §8）**，作为独立 DeepGEMM 能力 / 参考实现 / 基准存在。
 
 ### 5.1 核心改动
 
@@ -76,33 +87,39 @@ DeepGEMM-jasl 的提交 `2206a1d` 把根因讲得很直白：
 
 ### 5.2 基础设施改动
 
-- **SM120/SM121 归一**：CUDA major 12 → `sm_120f` JIT target + `sm120` include 后缀（统一内核族）。
+- **SM120/SM121 归一**：CUDA major 12 → `sm_120f` JIT target + `sm120` include 后缀（统一内核族）。`device_runtime.hpp` 的 `get_arch()` 把 major==12 归一为 `"120"`/`"120f"`。
 - **CUTLASS 升级**到 4.4.2。
 - **参考回退（reference fallbacks）**：早期用 ATen CUDA matmul 提供 HC prenorm 等的正确性回退，后续替换为真内核。
 - **回归测试**：`tests/test_sm120_kernels.py`（380 行）覆盖 HC prenorm GEMM 与 FP8 paged MQA logits（含 fused paged KV-cache 布局）。
 
-### 5.3 仍 gated（未移植到 SM12x）
+### 5.3 "gating" 机制：未移植算子在 SM12x 上如何被拒
 
-FP4 paged MQA、non-paged MQA、MegaMoE、通用 FP8/FP4 GEMM —— 这些在 SM12x 仍走 vLLM 侧的其他路径（CUTLASS scaled_mm / Marlin / Triton / FlashInfer）。
+DeepGEMM 每个算子 API 用 `device_runtime->get_arch_major()` 做架构派发梯子，**未移植到 SM12x 的算子没有 `arch_major == 12` 这一档，落到 `DG_HOST_UNREACHABLE(...)`**（展开为 `throw DGException`，会冒泡成 Python 端 RuntimeError）。举例（均在 fork 的 `csrc/apis/`）：
+
+- 通用 FP8/FP4 GEMM（`gemm.hpp`）：`if(9) sm90 else if(10) sm100 else UNREACHABLE` → SM12x 被 gate。
+- 非分页 MQA logits（`attention.hpp`）：无 12 分支 → SM12x 被 gate（FP4 与非分页 FP8 都没移植）。
+- 分页 MQA logits（`attention.hpp`）：**只有非-FP4(FP8) 有 12 分支**（`sm120_fp8_paged_mqa_logits`），FP4 版仍 gate。
+- MegaMoE：无 12 分支 → 被 gate。
+
+所谓 *"FP4 paged MQA, non-paged MQA, MegaMoE, and general FP8/FP4 GEMM remain gated"*，精确含义就是这些算子的派发梯子里没有 SM12x 分支、一旦在 SM12x 被调到就抛异常。vLLM 侧用 §8 的短路机制保证永远不会触发。
 
 ---
 
-## 6. Repo 2：vLLM `ds4-sm120-preview-dev`（服务 / Triton 层）
+## 6. Repo 2：vLLM `ds4-sm120-preview-dev`（SM12x 服务层 —— 实际运行路径）
 
 - **时间**：2026-05-05 ~ 06-16（持续开发）
 - **规模**：101 个 jasl 提交（另 2 个外部协作者各 1 个），约 **+14,500 / -381 行**，跨 106 个文件
-- **定位**：把 DeepGEMM 补的原语 + 自研 Triton 注意力串成完整前向，并完成服务化加固
+- **定位**：用自包含的 SM12x Triton/torch 实现所有 DeepGEMM-interface 算子 + 可移植 sparse MLA + 服务化加固。**不依赖 fork 内核。**
 
 ### 6.1 工作线一览
 
 | 工作线 | 关键文件 | 内容 |
 |---|---|---|
 | **可移植 Triton sparse MLA**（核心） | `vllm/v1/attention/backends/mla/sparse_mla_kernels.py`（3521 行）、`sparse_mla_env.py` | 重写 sparse MLA 全流程：decode + prefill + D512 split/chunked prefill；SM12x 自动启用 |
-| **DeepGEMM 接口回退** | `vllm/models/deepseek_v4/nvidia/ops/sm12x_deep_gemm_fallbacks.py`（706 行） | 为 mqa logits / paged mqa logits / tf32 hc prenorm 提供 torch/Triton 回退（无 fork 也能跑） |
-| **MQA Triton 内核** | `vllm/models/deepseek_v4/nvidia/ops/sm12x_mqa.py`（726 行） | paged FP8 MQA logits、不物化全 logits 的分块 row top-k |
+| **DeepGEMM 接口的 SM12x 实现** | `vllm/models/deepseek_v4/nvidia/ops/sm12x_deep_gemm_fallbacks.py`（706 行）、`sm12x_mqa.py`（726 行）、`fp8_einsum.py` | 用 Triton/torch 实现 mqa logits / paged mqa logits / hc prenorm / einsum，在 wrapper 层短路掉 DeepGEMM |
 | **手调 FP8 配置** | `vllm/model_executor/layers/quantization/utils/configs/*.json` 等 ~25 个 | 为 RTX PRO 6000 / GB10 调 dense GEMM 与 fused-MoE 的 FP8 W8A8 block tile |
 | **FP4 MoE** | `mxfp4.py`、`nvfp4.py`、`routed_experts.py`、`flashinfer_cutlass_moe.py` | NVFP4 ModelOpt 路由、FlashInfer CUTLASS MXFP4 opt-in、MoE metadata/EPLB |
-| **kernel warmup 基建** | `vllm/model_executor/warmup/kernel_warmup.py`（424 行） | 启动时预热 JIT Triton/DeepGEMM 内核，避免热路径 JIT |
+| **kernel warmup 基建** | `vllm/model_executor/warmup/kernel_warmup.py`（424 行） | 启动时预热 JIT Triton 内核，避免热路径 JIT |
 | **调度器长 prefill 公平性** | `vllm/v1/core/sched/scheduler.py`（+153 行）、测试 +578 行 | 超长 prefill 不饿死在跑的 decode/prefill/缓存长 prompt 尾部；prefix-cache 块哈希修复 |
 | **MTP spec decode** | `nvidia/mtp.py`、`vllm/v1/spec_decode/llm_base_proposer.py` | MTP 调度稳定化、workspace warmup、sparse SWA 重排、小批 cudagraph 挂起修复 |
 | **服务化加固** | `vllm/reasoning/deepseek_v4_reasoning_parser.py`（304 行） | 长上下文（~95k–100k）下 DSv4 偶尔漏 `</think>` 的防御式补全、DSML tool-call 流式标记处理 |
@@ -117,25 +134,26 @@ FP4 paged MQA、non-paged MQA、MegaMoE、通用 FP8/FP4 GEMM —— 这些在 S
 
 ## 7. 一次 DSv4 前向在 SM12x 上的数据流
 
+**全部走 vLLM 自实现，不经过 DeepGEMM 计算内核。**
+
 ```
 DSv4 forward on SM12x
 │
-├─ Dense FP8 GEMM（QKV / O-proj / dense 层）
-│    └─ DeepGEMM SM120 fp8_einsum/gemm  ──(fallback)──► vLLM CUTLASS scaled_mm(SM120) / Marlin + 手调配置
+├─ Dense FP8 GEMM（QKV / dense 层）
+│    └─ CUTLASS scaled_mm(SM120) / Marlin（is_deep_gemm_supported()=False → 不选 deep_gemm）
+│
+├─ O-proj FP8 einsum (bhr,hdr->bhd)
+│    └─ vLLM SM12x Triton  deepseek_v4_sm12x_fp8_einsum（fp8_einsum.py）
 │
 ├─ MoE 专家
-│    └─ fused-MoE（手调 FP8 W8A8 block 配置）/ FP4: MXFP4(FlashInfer CUTLASS) | NVFP4(ModelOpt)
-│       （DeepGEMM 的 MegaMoE FP8/FP4 在 SM12x 仍 gated → 走 vLLM 路径）
+│    └─ fused-MoE Triton / Marlin / FlashInfer CUTLASS / ModelOpt NVFP4
+│       （DeepGEMM MegaMoE 在 SM12x 不在路径）
 │
 ├─ Sparse MLA 注意力（核心）
-│   ├─ compressor + indexer 打分
-│   │   └─ paged MQA logits ─► DeepGEMM SM120 fp8_paged_mqa_logits
-│   │                            └─(fallback)─► vLLM sm12x_mqa.py / sm12x_deep_gemm_fallbacks（Triton/torch）
-│   ├─ HC prenorm GEMM ─► DeepGEMM SM120 tf32_hc_prenorm_gemm
-│   │                       └─(fallback)─► vLLM _tf32_hc_prenorm_gemm_torch（ATen matmul + square-sum）
-│   ├─ row top-k（不物化全 logits）─► vLLM sm12x_mqa.py Triton 分块 top-k
-│   └─ 稀疏注意力（gather KV / softmax / merge）─► vLLM 可移植 Triton sparse_mla_kernels.py
-│                                                  （DeepGEMM 无对应物，必须 Triton）
+│   ├─ 分页/非分页 MQA logits ─► vLLM sm12x_deep_gemm_fallbacks（Triton/torch）
+│   ├─ HC prenorm GEMM ─► vLLM sm12x_deep_gemm_fallbacks（torch）
+│   ├─ row top-k（免物化全 logits）─► vLLM sm12x_mqa.py Triton 分块 top-k
+│   └─ 稀疏注意力（gather KV / softmax / merge）─► vLLM sparse_mla_kernels.py（Triton）
 │
 ├─ MTP spec decode ─► vLLM proposer + warmup
 │
@@ -144,30 +162,47 @@ DSv4 forward on SM12x
 
 ---
 
-## 8. DeepGEMM 的角色与替代方案
+## 8. DeepGEMM 的运行时角色（订正版）
 
-### 8.1 DeepGEMM 不是唯一选择
+> ⚠️ 本节订正了早期版本的错误认识。早期误以为"装了 DeepGEMM-jasl fork → vLLM 在 SM12x 走 fork 的 CUDA 满血内核"。逐行追踪派发代码后确认：**vLLM 的 SM12x 运行路径是自包含的，不调用 fork 的任何计算内核。**
 
-vLLM 里**每个原语都有替代后端**，且 SM12x 已有**原生非-DeepGEMM FP8 路径**（如 `csrc/libtorch_stable/quantization/w8a8/cutlass/c3x/scaled_mm_blockwise_sm120_fp8.cu`）：
+### 8.1 SM12x 上每个 DeepGEMM 接口的实际走向
 
-| DeepGEMM 功能 | 替代后端 |
-|---|---|
-| FP8 GEMM（dense） | `scaled_mm/cutlass.py`（含 SM120 原生）、`scaled_mm/marlin.py`、`scaled_mm/pytorch.py`、`scaled_mm/flashinfer.py` |
-| FP8/FP4 MoE | `triton_moe.py`、`triton_cutlass_moe.py`、`marlin_moe.py`、`flashinfer_cutlass_moe.py`、`mxfp8_native_moe.py`、`nvfp4_emulation_moe.py`、`trtllm_fp8_moe.py`、`trtllm_nvfp4_moe.py` 等十几个 |
-| FP8 einsum | CUTLASS scaled_mm / Marlin / Triton |
-| paged MQA logits | jasl 的 `sm12x_deep_gemm_fallbacks.py`（torch）/ `sm12x_mqa.py`（Triton） |
-| HC prenorm GEMM | `_tf32_hc_prenorm_gemm_torch` |
+下表"证据"列：前 5 行与后 3 行均在 **vLLM repo**（`/root/vllm-jasl`）。
 
-**结论**：去掉 DeepGEMM-jasl，DSv4 在 SM12x 上照样能跑（dense 走 CUTLASS/Marlin SM120 FP8，MoE 走 Triton/FlashInfer，MQA logits 与 HC prenorm 走 torch/Triton 回退，sparse MLA 走可移植 Triton）。`sm12x_deep_gemm_fallbacks.py` 的存在正是为了让方案对 fork 有无具备鲁棒性。
+| DSv4 算子 | vLLM 入口 | SM12x 实际路径 | 证据（行号，vLLM repo） |
+|---|---|---|---|
+| O-proj FP8 einsum `bhr,hdr->bhd` | `deepseek_v4_fp8_einsum` | **vLLM SM12x Triton** `deepseek_v4_sm12x_fp8_einsum` | `vllm/models/deepseek_v4/nvidia/ops/fp8_einsum.py:186-199,269-271` |
+| 非分页 MQA logits（FP8） | `fp8_fp4_mqa_logits` | **vLLM 回退** `_fp8_mqa_logits_sm12x` | `vllm/utils/deep_gemm.py:452-455` |
+| 分页 MQA logits（FP8） | `fp8_fp4_paged_mqa_logits` | **vLLM 回退** `_fp8_paged_mqa_logits_sm12x` | `vllm/utils/deep_gemm.py:573-576` |
+| MQA top-k（免物化 logits） | `fp8_fp4_mqa_topk_indices` / `..._paged_...` | **vLLM 回退**（SM12x 专用，否则 return False） | `vllm/utils/deep_gemm.py:378-402,505-531` |
+| HC prenorm GEMM | `tf32_hc_prenorm_gemm` | **vLLM 回退** `_tf32_hc_prenorm_gemm_sm12x` | `vllm/utils/deep_gemm.py:620-621` |
+| 通用 FP8 dense GEMM | `scaled_mm` 后端选择 | **非 DeepGEMM**（CUTLASS SM120 / Marlin） | `vllm/model_executor/kernels/linear/scaled_mm/deep_gemm.py:50`；`vllm/platforms/cuda.py:559`（`support_deep_gemm` 不含 SM12x） |
+| FP8/FP4 MoE | `fused_moe` 后端选择 | **非 DeepGEMM**（Triton/Marlin/FlashInfer/ModelOpt） | 同上（`is_deep_gemm_supported()=False`） |
+| MegaMoE | `fp8_fp4_mega_moe` | **不在 SM12x 路径**（DeepGEMM 内 gated + vLLM 不选） | `vllm/utils/deep_gemm.py:371`、`vllm/models/deepseek_v4/nvidia/model.py:453` |
 
-### 8.2 为什么还要做 DeepGEMM fork
+### 8.2 对应到 fork 的三个 SM120 CUDA 内核
 
-1. **性能**：DeepGEMM 是 DeepSeek 针对这些**精确 op 和 shape** 手调的张量核心内核，TFLOPS 高。替代品更慢，或**表达不了 DSv4 特有的融合算子**（paged MQA logits 的特殊 KV 布局 + per-head weight + 无效位 -inf；HC prenorm 的 split-output square-sum）。用替代品等于拆成"GEMM + 多个 reduction" → 多次访存、需物化中间 logits（回退路径用 `_SM120_MQA_LOGITS_MAX_SCORE_BYTES = 64 MiB` 钳制显存，正是这个开销的体现）。
-2. **解除 stock DeepGEMM 拒绝 SM12x 的硬卡点**：DSv4 前向硬依赖 DeepGEMM 接口，而 stock DeepGEMM 在 SM12x dispatch 失败。fork 把"快路径"从"仅 SM90/SM100"扩展到 SM12x。
+| Fork 内核（DeepGEMM-jasl repo） | 行数 | vLLM SM12x 是否调用 |
+|---|---|---|
+| `sm120_fp8_einsum.cuh` | 126 | ❌ 否（O-proj 用 vLLM Triton，`fp8_einsum.py:269`） |
+| `sm120_fp8_paged_mqa_logits.cuh` | 395 | ❌ 否（wrapper 短路到 vLLM 回退，`deep_gemm.py:573`） |
+| `sm120_tf32_hc_prenorm_gemm.cuh` | 288 | ❌ 否（wrapper 无条件短路到 vLLM 回退，`deep_gemm.py:620`） |
 
-### 8.3 选型机制
+**机制（两层咬合）**：
 
-vLLM 的 `scaled_mm` 与 `fused_moe` 是**多后端 + 按 arch/quant 自动选**。jasl 的工作不是强制绑定 DeepGEMM，而是**为 "SM12x 这个 arch" 补上各后端的可用项 + 手调配置**。
+1. **wrapper 层短路**（`vllm/utils/deep_gemm.py`）：每个 DeepGEMM 接口 wrapper 在最前面用 `current_platform.is_device_capability_family(120)` 判断，命中即返回 vLLM 自研实现，根本到不了 DeepGEMM 的 `_*_impl`。
+2. **平台层排除**（`vllm/platforms/cuda.py:559`）：`support_deep_gemm()` 只认 `is_device_capability(90) or is_device_capability_family(100)`，**不含 SM12x** → `is_deep_gemm_supported()` 在 SM12x 为 False → 通用 GEMM/MoE 的 `scaled_mm`/`fused_moe` 后端选择在 SM12x 上根本不考虑 DeepGEMM（`scaled_mm/deep_gemm.py:50` 直接 return unsupported）。
+
+> 唯一可能仍触达 DeepGEMM 的是几个**布局/缩放辅助函数**（`transform_sf_into_required_layout` 等，见 `fp8_utils.py:1143/1166`），但那只是 scale 张量重排，非性能内核，也非 fork 价值所在；且 SM12x 主路径不依赖其产出。
+
+### 8.3 结论
+
+- **vLLM 的 SM12x DSv4 路径自包含，运行时不依赖 DeepGEMM-jasl 的任何计算内核。** 装不装 fork，SM12x 都走 vLLM 自研 Triton/torch。
+- 因此"去掉 DeepGEMM-jasl，DSv4 在 SM12x 照样跑"不只是"有替代后端兜底"——而是**主路径本就不经过 fork**。
+- **DeepGEMM-jasl fork 的真实定位**：jasl **4 月**的可行性验证（证明 DeepGEMM CUDA 路线在 SM120 上可跑：避开 SM90 WGMMA / SM100 tcgen05+TMA、自写 SM120 MMA）；**5 月**集成进 vLLM 时，他转而用自包含 SM12x Triton/torch，并在 wrapper 层短路掉 DeepGEMM。fork 遂成为**独立的 DeepGEMM 能力 / 正确性与性能基准 / 参考实现**，可在 vLLM 之外的 SM12x 推理栈直接使用，但不作为 vLLM 运行时必需项。
+
+> **关于"为什么还做了 fork"**：这是同一个人的两次尝试——4 月先用 CUDA（fork）证明可行，5 月在 vLLM 集成时改用自包含 Triton/torch（更易维护、不背 fork 依赖、Triton 在这些 shape 上够用），后者在 vLLM 内覆盖了前者的作用。fork 保留了独立的 DeepGEMM-SM12x 能力与基准价值。
 
 ---
 
@@ -186,8 +221,8 @@ vLLM 的 `scaled_mm` 与 `fused_moe` 是**多后端 + 按 arch/quant 自动选**
 ### 9.2 时间线
 
 ```
-04-24 ~ 04-26  DeepGEMM-jasl sm120 分支（补 SM12x 原语，解除起跑卡点）
-05-05 ~ 05-07  vLLM 侧奠基：portable sparse MLA Triton + SM12x fallback ops + 串接前向
+04-24 ~ 04-26  DeepGEMM-jasl sm120 分支（CUDA 可行性验证：SM12x 原语 + gating）
+05-05 ~ 05-07  vLLM 侧奠基：portable sparse MLA Triton + SM12x 自包含算子 + 串接前向
 05-08 ~ 05-20  内核调优、warmup、MQA top-k、FP8 配置
 05-21 ~ 06-16  调度器公平性、FP4 MoE、稳定化、rebase 跟随、清理（持续）
 ```
@@ -203,7 +238,7 @@ vLLM 的 `scaled_mm` 与 `fused_moe` 是**多后端 + 按 arch/quant 自动选**
 
 ### 10.1 核心设计：零配置自动启用
 
-在 SM12x（capability major == 12）上，sparse MLA 的 Triton 路径与相关开关**默认自动启用**，通常无需手动设置。DeepGEMM-jasl 需作为外部包安装（vLLM 优先用 site-packages 的 deep_gemm，见 `vllm/utils/deep_gemm.py` 的 `_import_deep_gemm`）。
+在 SM12x（capability major == 12）上，sparse MLA 的 Triton 路径与相关开关**默认自动启用**，通常无需手动设置。**vLLM 的 SM12x 路径自包含，不需要安装 DeepGEMM-jasl**——DeepGEMM-jasl 仅当需要独立的 DeepGEMM-SM12x 能力/基准时才安装（`vllm/utils/deep_gemm.py` 的 `_import_deep_gemm` 会优先用 site-packages 的 deep_gemm，但 SM12x 主路径不依赖它）。
 
 ### 10.2 主要环境变量（`vllm/envs.py`）
 
@@ -231,7 +266,7 @@ VLLM_DEEP_GEMM_WARMUP=skip|full|relax
 
 ### 10.3 文档现状
 
-- **无面向用户的 SM12x 专门文档/README/example**。jasl 在本分支从未碰 `docs/`。
+- **无面向用户的 SM12x 专门文档/README/example**。jasl 在本分支从未碰 `docs/`（本文档除外）。
 - 最接近"使用说明"的信息源：`vllm/envs.py` 里各变量的注释、`sparse_mla_env.py` 的 docstring、提交信息。
 - `docs/design/attention_backends.md` 的 "DeepSeek V4 Decode Backends" 小节只覆盖数据中心后端，Compute Cap. 写的是 "9.x-10.x"，**未涵盖 SM12x**。
 
@@ -252,28 +287,32 @@ VLLM_DEEP_GEMM_WARMUP=skip|full|relax
 
 ## 12. 附录：关键文件索引
 
-### DeepGEMM-jasl（`sm120` 分支）
+### DeepGEMM-jasl（`sm120` 分支，`/root/DeepGEMM-jasl`）
 ```
 deep_gemm/include/deep_gemm/mma/sm120.cuh                            # SM120 MMA 原语
-deep_gemm/include/deep_gemm/impls/sm120_fp8_einsum.cuh                # FP8 einsum
-deep_gemm/include/deep_gemm/impls/sm120_fp8_paged_mqa_logits.cuh      # FP8 paged MQA 打分
-deep_gemm/include/deep_gemm/impls/sm120_tf32_hc_prenorm_gemm.cuh      # HC prenorm GEMM
+deep_gemm/include/deep_gemm/impls/sm120_fp8_einsum.cuh                # FP8 einsum（vLLM 不调用）
+deep_gemm/include/deep_gemm/impls/sm120_fp8_paged_mqa_logits.cuh      # FP8 paged MQA 打分（vLLM 不调用）
+deep_gemm/include/deep_gemm/impls/sm120_tf32_hc_prenorm_gemm.cuh      # HC prenorm GEMM（vLLM 不调用）
 csrc/jit_kernels/heuristics/sm120.hpp                                 # JIT 派发启发式
+csrc/apis/{gemm,attention,mega,hyperconnection}.hpp                   # 架构派发梯子 + gating
+csrc/jit/device_runtime.hpp                                           # get_arch / sm_120f 归一
 tests/test_sm120_kernels.py                                           # 回归测试
 ```
 
-### vLLM（`ds4-sm120-preview-dev`）
+### vLLM（`ds4-sm120-preview-dev`，`/root/vllm-jasl`）—— 实际运行路径
 ```
 vllm/v1/attention/backends/mla/sparse_mla_kernels.py   (3521 行)      # 可移植 Triton sparse MLA
 vllm/v1/attention/backends/mla/sparse_mla_env.py                      # SM12x 自动启用 / 旋钮
 vllm/models/deepseek_v4/nvidia/flashmla.py             (827 行)        # sparse MLA 前向 + 派发
-vllm/models/deepseek_v4/nvidia/ops/sm12x_deep_gemm_fallbacks.py (706)  # DeepGEMM 接口回退
+vllm/models/deepseek_v4/nvidia/ops/sm12x_deep_gemm_fallbacks.py (706)  # mqa/paged-mqa/hc 的 SM12x 实现
 vllm/models/deepseek_v4/nvidia/ops/sm12x_mqa.py        (726 行)        # MQA Triton / top-k
-vllm/models/deepseek_v4/nvidia/ops/fp8_einsum.py                       # FP8 einsum 入口
+vllm/models/deepseek_v4/nvidia/ops/fp8_einsum.py                       # O-proj SM12x Triton einsum
+vllm/utils/deep_gemm.py                                               # DeepGEMM wrapper + SM12x 短路
+vllm/platforms/cuda.py:557-559                                         # support_deep_gemm (不含 SM12x)
+vllm/model_executor/kernels/linear/scaled_mm/deep_gemm.py              # FP8 GEMM 后端（SM12x 不选）
 vllm/model_executor/warmup/kernel_warmup.py            (424 行)        # 启动预热
 vllm/reasoning/deepseek_v4_reasoning_parser.py         (304 行)        # 长上下文 reasoning 兜底
 vllm/v1/core/sched/scheduler.py                                       # 长 prefill 公平性
-vllm/utils/deep_gemm.py                                               # DeepGEMM 导入/检测
 vllm/envs.py                                                          # 环境变量定义
 ```
 
