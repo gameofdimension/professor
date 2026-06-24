@@ -277,9 +277,11 @@ Release wheel 的实际 gencode 矩阵（`release-pipeline.yaml:10-18`）：
 
 > 补充：setup.py 里"按 CUDA 版本条件声明"的可选扩展（FA3 / FlashMLA / DeepGEMM / QuTLASS）判断为 `if USE_PRECOMPILED_EXTENSIONS or (CUDA_HOME and nvcc>=X)`（`setup.py:1113,1123,1133`）——预编译模式下它们恒被声明，但因 `build_ext` 是空操作，只参与抽取/打包逻辑，并不会被编译。
 
-### 7.3 抽取哪些文件（`setup.py:766-783`）
+### 7.3 抽取哪些文件（`setup.py:762-832`）
 
-从下载的 wheel 精确抽取这一组 `.so`：
+抽取分**两条路径**：
+
+**路径 A — 固定 `.so` 清单（`exact_members`，`setup.py:767-783`）**：从 wheel 根目录精确抽取这组 `.abi3.so`：
 
 ```
 vllm/_C.abi3.so
@@ -293,7 +295,23 @@ vllm/spinloop.abi3.so
 vllm/_rocm_C.abi3.so   (ROCm)
 ```
 
-加上 Rust 产物 `vllm/vllm-rs` + `vllm/_rust_*.so`，以及 vendored 纯 Python（`vllm_flash_attn/*.py`、`triton_kernels/*.py`、`flashmla/*.py`、`deep_gemm/**`、`fmha_sm100/**`）。
+> 注意：**DeepGEMM 不在此清单中**——它的 `.so` 不在包根目录，而是 vendored 在 `third_party/deep_gemm/` 下。
+
+**路径 B — 正则匹配 vendored 目录（`setup.py:787-832`）**：按目录全量抽取，各目录匹配范围不同：
+
+| 目录 | 正则 | 抽取范围 |
+|---|---|---|
+| `vllm/vllm_flash_attn/**` | 仅 `*.py`（跳过 `__init__.py`/`flash_attn_interface.py`） | 纯 Python（其 `.so` 走路径 A） |
+| `vllm/third_party/triton_kernels/**` | 仅 `*.py` | 纯 Python |
+| `vllm/third_party/flashmla/**` | 仅 `*.py` | 纯 Python（其 `.so` 走路径 A） |
+| `vllm/third_party/deep_gemm/**` | **`.*` 全部文件** | **含编译产物 `_C.cpython-*.so`** + `.py/.cuh/.h/.hpp` |
+| `vllm/third_party/fmha_sm100/**` | `.*` 全部文件 | `.py` + `.cu` helper（无 `.so`） |
+
+**所以 DeepGEMM 的 `.so` 会被抽取**，只是走路径 B 的 `deep_gemm_regex`（`setup.py:802-803`，注释明确"extract all files (.py, .so, .cuh, .h, .hpp, etc.)"），而非根目录固定清单。DeepGEMM 的 `.so` 是 **per-CPython** 的 `_C.cpython-*.so`（非 abi3），因此以 vendored 包形式放在 `third_party/deep_gemm/`，并按 CPython 解释器版本分别构建（`Dockerfile:396-399`、`DEEPGEMM_PYTHON_INTERPRETERS`）。
+
+> 抽取前提：路径 A 和路径 B 中除 Rust 外的部分，都受 `extract_extensions`（= `VLLM_USE_PRECOMPILED`）门控；Rust 产物受 `extract_rust_frontend` 门控。两者均在 `setup.py:806-832` 的抽取循环里判断。
+
+加上 Rust 产物 `vllm/vllm-rs` + `vllm/_rust_*.so`。
 
 ### 7.4 wheel 来源解析顺序（`setup.py:637-734`）
 
