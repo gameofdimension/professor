@@ -1,11 +1,11 @@
 # vLLM GPU 构建过程分析报告
 
 > 调查对象：本仓库（`vllm-sm120`）的 GPU（NVIDIA CUDA）构建过程。
-> 
+>
 > 基线：`vllm-project/vllm`，`origin` 指向官方仓库。
-> 
+>
 > 分析所基于的 commit：**`accaa434f36b37a35b3e68eede167415ecc83c51`**（短 `accaa434f`，`git describe = v0.23.1rc0-307-gaccaa434f`，日期 2026-06-23，"[Rust Frontend] Support echo for token-ID completion prompts (#46219)"）。下文所有 `file:line` 均对应该 commit 的工作树状态。
-> 
+>
 > 方法：全部结论均经源码 / 编译脚本 / CI 脚本 / Dockerfile 直接核对（附 `file:line` 证据），未依赖网络搜索，避免幻觉。
 
 ---
@@ -18,7 +18,8 @@
 4. [vLLM 本身编译的 C++/CUDA 源码](#4-vllm-本身编译的-ccuda-源码)
 5. [wheel 中包含的 Python source / 产物](#5-wheel-中包含的-python-source--产物)
 6. [CI / Docker 的实际 GPU 构建命令](#6-ci--docker-的实际-gpu-构建命令)
-7. [附录：关键证据汇总](#7-附录关键证据汇总)
+7. [预编译机制详解：`VLLM_USE_PRECOMPILED`](#7-预编译机制详解vllm_use_precompiled)
+8. [附录：关键证据汇总](#8-附录关键证据汇总)
 
 ---
 
@@ -249,7 +250,84 @@ Release wheel 的实际 gencode 矩阵（`release-pipeline.yaml:10-18`）：
 
 ---
 
-## 7. 附录：关键证据汇总
+## 7. 预编译机制详解：`VLLM_USE_PRECOMPILED`
+
+**一句话**：设了它就跳过所有 C++/CUDA（和 Rust）本地编译，转而从官方预编译 wheel 中抽取现成的 `.so` 直接打包，把"几小时的 nvcc 编译"变成"下载 + 解压"。
+
+### 7.1 定义（`vllm/envs.py:594-596`）
+
+```python
+"VLLM_USE_PRECOMPILED": lambda: (
+    os.environ.get("VLLM_USE_PRECOMPILED", "").strip().lower() in ("1", "true")
+    or bool(os.environ.get("VLLM_PRECOMPILED_WHEEL_LOCATION"))  # 注意这条
+)
+```
+
+> 注意：**只设 `VLLM_PRECOMPILED_WHEEL_LOCATION`（即使不显式设 `=1`）也会隐式打开此开关**。
+> 关联开关：`VLLM_USE_PRECOMPILED_RUST`（`envs.py:599-600`）、`VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX`（`envs.py:603-604`）。
+
+### 7.2 触发的 4 个行为
+
+| # | 行为 | 证据 |
+|---|---|---|
+| 1 | **跳过 C++/CUDA 编译**：`build_ext` 换成 `precompiled_build_ext`（空操作，仅打印 `"Skipping build_ext: using precompiled extensions."`） | `setup.py:1210-1213`、`setup.py:449-457` |
+| 2 | **跳过 Rust 编译**：派生 `USE_PRECOMPILED_RUST_FRONTEND = VLLM_USE_PRECOMPILED or VLLM_USE_PRECOMPILED_RUST`，`build_rust` → `precompiled_build_rust`（产物齐全则跳过，否则回退本地编译） | `setup.py:52-54`、`setup.py:1216-1220`、`setup.py:460-487` |
+| 3 | **下载预编译 wheel 并抽取产物**：`determine_wheel_url()` + `extract_precompiled_and_patch_package()`，把现成 `.so`/rust/vendored `.py` 解到源码树并 patch `package_data` | `setup.py:1186-1195`、`setup.py:737-852` |
+| 4 | **版本号加 `+precompiled` 后缀**（除非 `VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX=1`） | `setup.py:1018-1019` |
+
+> 补充：setup.py 里"按 CUDA 版本条件声明"的可选扩展（FA3 / FlashMLA / DeepGEMM / QuTLASS）判断为 `if USE_PRECOMPILED_EXTENSIONS or (CUDA_HOME and nvcc>=X)`（`setup.py:1113,1123,1133`）——预编译模式下它们恒被声明，但因 `build_ext` 是空操作，只参与抽取/打包逻辑，并不会被编译。
+
+### 7.3 抽取哪些文件（`setup.py:766-783`）
+
+从下载的 wheel 精确抽取这一组 `.so`：
+
+```
+vllm/_C.abi3.so
+vllm/_C_stable_libtorch.abi3.so
+vllm/_moe_C_stable_libtorch.abi3.so
+vllm/_qutlass_C.abi3.so
+vllm/_flashmla_C.abi3.so / _flashmla_extension_C.abi3.so / _sparse_flashmla_C.abi3.so
+vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so / _vllm_fa3_C.abi3.so
+vllm/cumem_allocator.abi3.so
+vllm/spinloop.abi3.so
+vllm/_rocm_C.abi3.so   (ROCm)
+```
+
+加上 Rust 产物 `vllm/vllm-rs` + `vllm/_rust_*.so`，以及 vendored 纯 Python（`vllm_flash_attn/*.py`、`triton_kernels/*.py`、`flashmla/*.py`、`deep_gemm/**`、`fmha_sm100/**`）。
+
+### 7.4 wheel 来源解析顺序（`setup.py:637-734`）
+
+| 优先级 | 来源 | 触发条件 |
+|---|---|---|
+| 1 | 本地路径或 URL | 显式设 `VLLM_PRECOMPILED_WHEEL_LOCATION` |
+| 2 | ROCm 本地 wheel 或 AMD PyPI 索引 | ROCm 系统 |
+| 3 | **官方 nightly 仓库** `https://wheels.vllm.ai/{commit}/{variant}/vllm/` | 默认（CUDA） |
+
+第 3 条细节：
+
+- **variant**（cu129/cu130）：`VLLM_PRECOMPILED_WHEEL_VARIANT` 或自动探测（`torch.version.cuda` → `nvidia-smi`，`setup.py:527-568`）
+- **commit**：`VLLM_PRECOMPILED_WHEEL_COMMIT`，否则取上游 main HEAD 经 `git merge-base` 算出的基线 commit（`setup.py:858-920`）
+
+### 7.5 典型用法
+
+1. **本地开发免编译**（`AGENTS.md` 推荐）：
+   ```
+   VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
+   ```
+   下载匹配 commit+CUDA 变体的 nightly wheel，跳过 nvcc 全量编译。
+
+2. **Dockerfile 两阶段复用**（`docker/Dockerfile:549-552`）：
+   - `csrc-build` 阶段做真正的重编译 → 产出 `dist/*.whl`
+   - `build` 阶段设 `VLLM_USE_PRECOMPILED=1` + `VLLM_PRECOMPILED_WHEEL_LOCATION=$(ls /precompiled-wheels/*.whl)`，**复用**前一阶段 `.so` 重新打包，不重编
+
+### 7.6 ⚠️ 对本 fork 的注意点
+
+- 预编译 wheel 的 `.so` 按**上游 commit**（或 `VLLM_PRECOMPILED_WHEEL_COMMIT`）构建。本仓库当前 HEAD `accaa434f` 虽是上游 commit，但属 v0.23.x 旧基线；fork 若在 C++/CUDA 侧有改动，下载的 nightly wheel 与本地源码会**不一致**，抽出的 `.so` 可能与改过的源码不匹配。
+- 若 `wheels.vllm.ai` 上找不到对应 commit 的 wheel，解析会失败。此时最稳妥的做法：用 `VLLM_PRECOMPILED_WHEEL_LOCATION` 指向自己构建好的本地 wheel，或干脆走 `uv pip install -e .` 从源码编译。
+
+---
+
+## 8. 附录：关键证据汇总
 
 ### 外部工程 git 锁定版本（已逐一核对）
 
