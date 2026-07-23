@@ -1,0 +1,1164 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# SID-GR HTTP 服务适配层的 OpenAPI 描述文档。
+# 事实来源：src/gr_inference/gr_serving/http.py（GRHTTPServingAdapter._dispatch）。
+# 每个操作的 x-source 字段标注了该路由分支在 _dispatch 中的源码位置（文件:行号）。
+openapi: 3.0.3
+info:
+  title: SID-GR Inference Serving API
+  description: |
+    `GRHTTPServingAdapter` 暴露的 HTTP API（基于进程内服务门面
+    `GRInProcessServingFacade` 的无框架适配层）。
+
+    约定：
+    - 除 `GET /metrics/prometheus` 返回 `text/plain; version=0.0.4` 外，
+      所有请求/响应体均为 JSON 对象。
+    - 错误响应统一为以下信封格式：
+      `{"error": {"code": ..., "message": ..., "retryable": ..., "status": ...}}`。
+    - `/submit` 和 `/submit_many` 为异步接口（202 + 返回请求 id）；
+      `/generate` 为同步接口（阻塞等待结果，兼容 SGLang）。
+    - 当服务端以 `allow_manual_tick=false` 启动时，
+      `POST /tick` 和 `POST /run_until_idle` 返回 403。
+    - 当目录重载被禁用（`allow_catalog_reload=false`）时，
+      `POST /catalog/reload` 和 `POST /catalog/rollback` 返回 403。
+  version: 0.1.0
+
+servers:
+  - url: http://127.0.0.1:8000
+    description: 默认本地监听地址（host/port 可通过 GR_HTTP_HOST / GR_HTTP_PORT 配置）
+
+security:
+  - bearerAuth: []
+  - apiKeyHeader: []
+
+tags:
+  - name: health
+    description: 存活、就绪、构建信息与配置
+  - name: status
+    description: 调度器状态、指标与请求查询
+  - name: requests
+    description: 请求提交、生成、轮询与取消
+  - name: manual-control
+    description: 手动调度控制（要求 allow_manual_tick 开启）
+  - name: lifecycle
+    description: 排空（drain）与关闭
+  - name: catalog
+    description: 物品目录状态、热加载与回滚
+
+paths:
+  /health:
+    get:
+      tags: [health]
+      summary: 存活探针
+      description: 始终返回 ok。豁免 API key 鉴权。
+      operationId: getHealth
+      x-source: src/gr_inference/gr_serving/http.py:159
+      security: []
+      responses:
+        '200':
+          description: 服务存活
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+
+  /ready:
+    get:
+      tags: [health]
+      summary: 就绪探针
+      description: |
+        满足以下条件时视为就绪：服务未处于 draining、等待队列未满
+        （配置了上限时）、后台 worker 正在运行（或允许手动 tick）。
+        豁免 API key 鉴权。
+      operationId: getReady
+      x-source: src/gr_inference/gr_serving/http.py:161
+      security: []
+      responses:
+        '200':
+          description: 就绪详情（始终返回 HTTP 200，需检查 `ready` 字段）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ready:
+                    type: boolean
+                  reasons:
+                    type: array
+                    items:
+                      type: string
+                      enum:
+                        - draining
+                        - waiting_queue_full
+                        - worker_not_running
+                        - worker_last_error
+                        - no_worker_and_manual_tick_disabled
+                  lifecycle:
+                    $ref: '#/components/schemas/Lifecycle'
+                  worker:
+                    type: object
+                    nullable: true
+                    properties:
+                      running:
+                        type: boolean
+                      last_error:
+                        type: string
+                        nullable: true
+                  admission:
+                    $ref: '#/components/schemas/Admission'
+                  scheduler:
+                    type: object
+                    properties:
+                      waiting_prefill: { type: integer }
+                      decoding: { type: integer }
+                      finished: { type: integer }
+                      failed_requests: { type: integer }
+
+  /config:
+    get:
+      tags: [health]
+      summary: 当前生效的服务端配置
+      operationId: getConfig
+      x-source: src/gr_inference/gr_serving/http.py:163
+      responses:
+        '200':
+          description: 校验策略、鉴权、日志、构建信息与路由清单
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  validation_policy:
+                    $ref: '#/components/schemas/ValidationPolicy'
+                  auth:
+                    type: object
+                    properties:
+                      enabled: { type: boolean }
+                      api_key_header: { type: string, nullable: true }
+                      accepted_schemes:
+                        type: array
+                        items: { type: string }
+                      exempt_routes:
+                        type: array
+                        items: { type: string }
+                  logging:
+                    type: object
+                    properties:
+                      request_logging_enabled: { type: boolean }
+                      log_requests_level: { type: string }
+                  build:
+                    $ref: '#/components/schemas/BuildInfo'
+                  readiness_policy:
+                    type: object
+                    additionalProperties: { type: boolean }
+                  lifecycle:
+                    $ref: '#/components/schemas/Lifecycle'
+                  scheduler_policy:
+                    type: object
+                    nullable: true
+                  worker:
+                    type: object
+                    nullable: true
+                  item_constraints_configured:
+                    type: boolean
+                  routes:
+                    type: object
+                    description: 按类别分组的路由清单
+                    additionalProperties:
+                      type: array
+                      items: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /build:
+    get:
+      tags: [health]
+      summary: 构建信息
+      operationId: getBuild
+      x-source: src/gr_inference/gr_serving/http.py:165
+      responses:
+        '200':
+          description: 框架版本与运行时信息
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  build:
+                    $ref: '#/components/schemas/BuildInfo'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/models:
+    get:
+      tags: [health]
+      summary: OpenAI 兼容的模型列表
+      operationId: listModels
+      x-source: src/gr_inference/gr_serving/http.py:167
+      responses:
+        '200':
+          description: 单条目的模型列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object:
+                    type: string
+                    example: list
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        object: { type: string, example: model }
+                        created: { type: integer, example: 0 }
+                        owned_by: { type: string, example: sid-gr-inference }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /status:
+    get:
+      tags: [status]
+      summary: 整体服务状态
+      description: 执行器/调度器状态，附带生命周期与物品约束信息。
+      operationId: getStatus
+      x-source: src/gr_inference/gr_serving/http.py:186
+      responses:
+        '200':
+          description: 状态快照（具体字段取决于执行器后端）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  waiting_prefill: { type: integer }
+                  decoding: { type: integer }
+                  finished: { type: integer }
+                  failed_requests: { type: integer }
+                  lifecycle:
+                    $ref: '#/components/schemas/Lifecycle'
+                  worker:
+                    type: object
+                    nullable: true
+                  policy:
+                    type: object
+                    nullable: true
+                  item_constraints:
+                    type: object
+                    nullable: true
+                  kv_events:
+                    type: array
+                    items: { type: object }
+                additionalProperties: true
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /metrics:
+    get:
+      tags: [status]
+      summary: JSON 格式指标快照
+      operationId: getMetrics
+      x-source: src/gr_inference/gr_serving/http.py:188
+      responses:
+        '200':
+          description: 扁平的指标名到数值的映射
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: number
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /metrics/prometheus:
+    get:
+      tags: [status]
+      summary: Prometheus 文本格式指标
+      operationId: getMetricsPrometheus
+      x-source: src/gr_inference/gr_serving/http.py:190
+      responses:
+        '200':
+          description: 以 `gr_serving_*` gauge 形式输出的指标
+          content:
+            text/plain; version=0.0.4:
+              schema:
+                type: string
+              example: |
+                # HELP gr_serving_info GR serving Prometheus exporter info.
+                # TYPE gr_serving_info gauge
+                gr_serving_info 1
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /requests:
+    get:
+      tags: [status]
+      summary: 所有已知请求的状态
+      operationId: listRequests
+      x-source: src/gr_inference/gr_serving/http.py:195
+      responses:
+        '200':
+          description: 逐请求的状态行
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  requests:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RequestStatus'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /requests/{request_id}:
+    get:
+      tags: [status]
+      summary: 单个请求的状态
+      operationId: getRequest
+      x-source: src/gr_inference/gr_serving/http.py:197
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 请求状态
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  request:
+                    $ref: '#/components/schemas/RequestStatus'
+        '404': { $ref: '#/components/responses/NotFound' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /kv/events:
+    get:
+      tags: [status]
+      summary: KV 池事件
+      operationId: getKvEvents
+      x-source: src/gr_inference/gr_serving/http.py:201
+      responses:
+        '200':
+          description: 当前状态快照中记录的 KV 事件
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items: { type: object }
+                  count:
+                    type: integer
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /submit:
+    post:
+      tags: [requests]
+      summary: 提交一个异步推理请求
+      operationId: submitRequest
+      x-source: src/gr_inference/gr_serving/http.py:203
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ServingRequestInput'
+      responses:
+        '202':
+          description: 请求已受理
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  request_id:
+                    type: string
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '429': { $ref: '#/components/responses/Overloaded' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /submit_many:
+    post:
+      tags: [requests]
+      summary: 批量提交异步推理请求
+      description: 批量大小受 `max_submit_many` 限制（默认 32）。
+      operationId: submitManyRequests
+      x-source: src/gr_inference/gr_serving/http.py:209
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [requests]
+              properties:
+                requests:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/ServingRequestInput'
+      responses:
+        '202':
+          description: 请求已全部受理
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  request_ids:
+                    type: array
+                    items: { type: string }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '429': { $ref: '#/components/responses/Overloaded' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /generate:
+    post:
+      tags: [requests]
+      summary: SGLang 兼容的同步生成接口
+      description: |
+        接收 SGLang 风格的 `/generate` 负载，内部提交后阻塞等待结果。
+        要求提供 `input_ids`（服务端不做 prompt 文本分词；配合
+        `sglang.bench_serving` 使用时请加 `--tokenize-prompt`）。
+        `max_decode_steps` 推导为 `max(1, max_new_tokens - 1)`；
+        beam 宽度取自 `sampling_params.n`。
+      operationId: generate
+      x-source: src/gr_inference/gr_serving/http.py:225
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SglangGenerateRequest'
+      responses:
+        '200':
+          description: 生成结果（SGLang 兼容结构）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SglangGenerateResponse'
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/Overloaded' }
+        '504': { $ref: '#/components/responses/GenerateTimeout' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /poll/{request_id}:
+    get:
+      tags: [requests]
+      summary: 轮询请求结果
+      operationId: pollResult
+      x-source: src/gr_inference/gr_serving/http.py:253
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 请求未完成时 `ready=false`
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ready:
+                    type: boolean
+                  response:
+                    $ref: '#/components/schemas/ServingResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /result/{request_id}:
+    get:
+      tags: [requests]
+      summary: 获取已完成请求的结果
+      description: 请求尚未完成时返回 404（`not_found`）。
+      operationId: getResult
+      x-source: src/gr_inference/gr_serving/http.py:263
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 已完成的结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServingResponse'
+        '404': { $ref: '#/components/responses/NotFound' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /cancel:
+    post:
+      tags: [requests]
+      summary: 取消请求
+      operationId: cancelRequest
+      x-source: src/gr_inference/gr_serving/http.py:265
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [request_id]
+              properties:
+                request_id:
+                  type: string
+                reason:
+                  type: string
+                  default: cancelled
+      responses:
+        '200':
+          description: 被取消请求的最终响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServingResponse'
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /tick:
+    post:
+      tags: [manual-control]
+      summary: 手动推进一个调度 tick
+      description: 当 `allow_manual_tick=false` 时禁用（返回 403 `route_disabled`）。
+      operationId: tick
+      x-source: src/gr_inference/gr_serving/http.py:227
+      responses:
+        '200':
+          description: tick 执行结果元数据
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '403': { $ref: '#/components/responses/RouteDisabled' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /run_until_idle:
+    post:
+      tags: [manual-control]
+      summary: 持续调度直到所有工作清空
+      description: 当 `allow_manual_tick=false` 时禁用（返回 403 `route_disabled`）。
+      operationId: runUntilIdle
+      x-source: src/gr_inference/gr_serving/http.py:235
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                max_ticks:
+                  type: integer
+                  nullable: true
+                timeout_unfinished:
+                  type: boolean
+                  default: false
+      responses:
+        '200':
+          description: 本次运行期间完成的请求响应列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  responses:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ServingResponse'
+        '403': { $ref: '#/components/responses/RouteDisabled' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /drain:
+    post:
+      tags: [lifecycle]
+      summary: 停止接收新请求
+      operationId: drain
+      x-source: src/gr_inference/gr_serving/http.py:269
+      responses:
+        '200':
+          description: drain 之后的生命周期状态
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  lifecycle:
+                    $ref: '#/components/schemas/Lifecycle'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /shutdown:
+    post:
+      tags: [lifecycle]
+      summary: 排空、运行至空闲并返回最终状态
+      operationId: shutdown
+      x-source: src/gr_inference/gr_serving/http.py:271
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                max_ticks:
+                  type: integer
+                  nullable: true
+                timeout_unfinished:
+                  type: boolean
+                  default: false
+                stop_timeout_s:
+                  type: number
+                  description: 当门面提供 `stop` 钩子时会转发该参数
+      responses:
+        '200':
+          description: 最终生命周期状态、收集到的响应与状态快照
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  lifecycle:
+                    $ref: '#/components/schemas/Lifecycle'
+                  responses:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ServingResponse'
+                  status:
+                    type: object
+                    additionalProperties: true
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /catalog/status:
+    get:
+      tags: [catalog]
+      summary: 物品目录状态
+      operationId: getCatalogStatus
+      x-source: src/gr_inference/gr_serving/http.py:199
+      responses:
+        '200':
+          description: "目录状态（未配置目录时 `catalog: null`）"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  catalog:
+                    type: object
+                    nullable: true
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /catalog/reload:
+    post:
+      tags: [catalog]
+      summary: 从 JSONL 文件热加载物品目录
+      description: 当 `allow_catalog_reload=false` 时禁用（返回 403 `route_disabled`）。
+      operationId: reloadCatalog
+      x-source: src/gr_inference/gr_serving/http.py:279
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path, vocab_size]
+              properties:
+                path:
+                  type: string
+                  description: JSONL 物品目录文件路径
+                vocab_size:
+                  type: integer
+                eos_token_id:
+                  type: integer
+                  nullable: true
+                allow_eos_for_terminal:
+                  type: boolean
+                  default: true
+                item_id_field:
+                  type: string
+                  default: item_id
+                token_ids_field:
+                  type: string
+                  default: token_ids
+                metadata_field:
+                  type: string
+                  nullable: true
+                  default: metadata
+                allow_duplicate_item_ids:
+                  type: boolean
+                  default: false
+                allow_duplicate_token_paths:
+                  type: boolean
+                  default: false
+      responses:
+        '200':
+          description: 新的目录版本号与状态
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version:
+                    type: integer
+                  catalog:
+                    type: object
+                    nullable: true
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '403': { $ref: '#/components/responses/RouteDisabled' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /catalog/rollback:
+    post:
+      tags: [catalog]
+      summary: 回滚物品目录到上一个版本
+      description: 当 `allow_catalog_reload=false` 时禁用（返回 403 `route_disabled`）。
+      operationId: rollbackCatalog
+      x-source: src/gr_inference/gr_serving/http.py:304
+      responses:
+        '200':
+          description: 恢复后的目录版本号与状态
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version:
+                    type: integer
+                  catalog:
+                    type: object
+                    nullable: true
+        '403': { $ref: '#/components/responses/RouteDisabled' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: "以 `Authorization: Bearer <key>` 形式发送 API key（启用鉴权时）"
+    apiKeyHeader:
+      type: apiKey
+      in: header
+      name: X-GR-API-Key
+      description: 备选的 API key 请求头（名称可配置）
+
+  parameters:
+    RequestId:
+      name: request_id
+      in: path
+      required: true
+      schema:
+        type: string
+
+  responses:
+    ValidationError:
+      description: 请求校验失败（code 为 `validation_error`）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: 缺少 API key（code 为 `unauthorized`）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: API key 无效（code 为 `forbidden`）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RouteDisabled:
+      description: 路由被服务端策略禁用（code 为 `route_disabled`）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: 未知的 request id 或结果尚未完成（code 为 `not_found`）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: |
+        冲突——`request_id` 重复（code 为 `duplicate_request_id`）或门面正在
+        draining（code 为 `service_draining`，可重试）。
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    PayloadTooLarge:
+      description: 请求体或批量超限（code 为 `payload_too_large` / `too_many_requests`）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Overloaded:
+      description: 等待队列容量超限（code 为 `overloaded`，可重试）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    GenerateTimeout:
+      description: 同步 /generate 等待超过 300 秒（code 为 `generate_timeout`，可重试）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              enum:
+                - http_error
+                - validation_error
+                - not_found
+                - unauthorized
+                - forbidden
+                - route_disabled
+                - conflict
+                - duplicate_request_id
+                - service_draining
+                - payload_too_large
+                - too_many_requests
+                - overloaded
+                - generate_timeout
+            message:
+              type: string
+            retryable:
+              type: boolean
+            status:
+              type: integer
+
+    BuildInfo:
+      type: object
+      properties:
+        framework: { type: string, example: sid-gr-inference }
+        version: { type: string }
+        python: { type: string }
+        platform: { type: string }
+        model_name: { type: string }
+        model_dir: { type: string }
+      additionalProperties: true
+
+    Lifecycle:
+      type: object
+      properties:
+        accepting_requests: { type: boolean }
+        draining: { type: boolean }
+        idle: { type: boolean }
+        in_flight_requests: { type: integer }
+
+    Admission:
+      type: object
+      properties:
+        waiting_prefill: { type: integer }
+        max_waiting_requests:
+          type: integer
+          nullable: true
+        available_waiting_slots:
+          type: integer
+          nullable: true
+        queue_full: { type: boolean }
+
+    ValidationPolicy:
+      type: object
+      properties:
+        max_request_bytes:
+          type: integer
+          nullable: true
+          default: 1048576
+        max_context_len: { type: integer, nullable: true }
+        max_decode_steps: { type: integer, nullable: true }
+        max_beam_width: { type: integer, nullable: true }
+        max_submit_many:
+          type: integer
+          nullable: true
+          default: 32
+        max_waiting_requests: { type: integer, nullable: true }
+        max_timeout_ticks: { type: integer, nullable: true }
+        allow_manual_tick:
+          type: boolean
+          default: true
+        allow_catalog_reload:
+          type: boolean
+          default: true
+
+    ServingRequestInput:
+      type: object
+      required: [request_id, input_ids, max_decode_steps, beam_width]
+      properties:
+        request_id:
+          type: string
+          description: 客户端提供的唯一 id；重复时返回 409
+        input_ids:
+          description: 已分词的 prompt；扁平的 token id 列表（或按 beam 分行的嵌套列表）
+          oneOf:
+            - type: array
+              items: { type: integer }
+            - type: array
+              items:
+                type: array
+                items: { type: integer }
+        max_decode_steps:
+          type: integer
+          minimum: 1
+        beam_width:
+          type: integer
+          minimum: 1
+        stop_token_ids:
+          type: array
+          items: { type: integer, minimum: 0 }
+          default: []
+        timeout_ticks:
+          type: integer
+          minimum: 0
+          nullable: true
+          description: 会被拷贝进请求 metadata；调度器层面以 tick 为单位的截止时间
+        metadata:
+          type: object
+          additionalProperties: true
+          default: {}
+        beam_width_policy:
+          $ref: '#/components/schemas/BeamWidthPolicy'
+        logits_processors:
+          type: array
+          items:
+            $ref: '#/components/schemas/LogitsProcessorSpec'
+          default: []
+
+    BeamWidthPolicy:
+      type: object
+      description: 动态 beam 宽度策略；两种类型二选一
+      properties:
+        type:
+          type: string
+          enum: [score_margin, score_margin_shrink, scheduled, schedule]
+        score_margin:
+          type: number
+          description: score_margin 类策略必填
+        min_beam_width:
+          type: integer
+          default: 1
+        monotonic_shrink:
+          type: boolean
+          default: true
+        schedule:
+          type: object
+          description: '步数到宽度的映射，scheduled 类策略必填（如 {"0": 8, "2": 4}）'
+          additionalProperties:
+            type: integer
+            minimum: 1
+
+    LogitsProcessorSpec:
+      type: object
+      description: 内建的请求级 logits 处理器
+      properties:
+        type:
+          type: string
+          enum: [token_suppress, suppress_tokens, bad_tokens, token_bias, bias_tokens]
+        token_ids:
+          type: array
+          items: { type: integer, minimum: 0 }
+          description: token_suppress 必填
+        fill_value:
+          type: number
+          description: 抑制时填充的 logit 值（默认 -inf）
+        token_bias:
+          description: token_bias 必填；token id 到偏置的对象映射，或 [id, bias] 二元组列表
+          oneOf:
+            - type: object
+              additionalProperties: { type: number }
+            - type: array
+              items:
+                type: array
+                items: { type: number }
+        phases:
+          type: array
+          items:
+            type: string
+            enum: [prefill, decode]
+          default: [prefill, decode]
+
+    ServingResponse:
+      type: object
+      properties:
+        request_id:
+          type: string
+        token_ids:
+          type: array
+          items: { type: integer }
+        scores:
+          type: array
+          items: { type: number }
+        metadata:
+          type: object
+          description: |
+            自由形式的结果元数据。常见字段：`stop_reason`
+            （`stop_token` | `item_complete` | `max_decode_steps` | `cancelled` | `timeout`）、
+            `beam_results`（SGLang 兼容的行，含 `output_ids`、`text`、
+            `meta_info.finish_reason`、`meta_info.sequence_score`）、
+            `active_beam_width`、`item_results`。
+          additionalProperties: true
+
+    RequestStatus:
+      type: object
+      properties:
+        request_id: { type: string }
+        stage:
+          type: string
+          description: 调度器阶段（如 waiting_prefill、decoding、finished）
+        ready: { type: boolean }
+        result_available: { type: boolean }
+        current_decode_step: { type: integer }
+        remaining_decode_steps: { type: integer }
+        max_decode_steps: { type: integer }
+        beam_width: { type: integer }
+        active_beam_width: { type: integer }
+        submitted_tick: { type: integer }
+        admitted_tick:
+          type: integer
+          nullable: true
+        finished_tick:
+          type: integer
+          nullable: true
+        age_ticks: { type: integer }
+        elapsed_ticks: { type: integer }
+        timeout_ticks:
+          type: integer
+          nullable: true
+        deadline_tick:
+          type: integer
+          nullable: true
+        stop_reason:
+          type: string
+          nullable: true
+        has_item_constraints: { type: boolean }
+        beam_width_policy:
+          type: object
+          nullable: true
+          properties:
+            type: { type: string }
+            widths:
+              type: object
+              additionalProperties: { type: integer }
+            schedule:
+              type: object
+              additionalProperties: { type: integer }
+
+    SglangGenerateRequest:
+      type: object
+      required: [input_ids]
+      properties:
+        input_ids:
+          type: array
+          items: { type: integer }
+          description: 已分词的 prompt（不支持文本 prompt）
+        rid:
+          type: string
+          description: 请求 id 别名（也接受 `request_id`）
+        request_id:
+          type: string
+        n:
+          type: integer
+          minimum: 1
+          description: beam 宽度（顶层别名；`sampling_params.n` 优先）
+        beam_width:
+          type: integer
+          minimum: 1
+          description: beam 宽度的兜底别名
+        max_new_tokens:
+          type: integer
+          minimum: 1
+          description: 顶层别名；`sampling_params.max_new_tokens` 优先
+        stream:
+          type: boolean
+          default: true
+          description: 仅记录在 metadata 中；HTTP 响应并不真正流式返回
+        sampling_params:
+          type: object
+          properties:
+            max_new_tokens:
+              type: integer
+              minimum: 1
+              default: 1
+            n:
+              type: integer
+              minimum: 1
+              default: 1
+            ignore_eos:
+              type: boolean
+              default: false
+            stop_token_ids:
+              type: array
+              items: { type: integer }
+        logits_processors:
+          type: array
+          items:
+            $ref: '#/components/schemas/LogitsProcessorSpec'
+
+    SglangGenerateResponse:
+      type: object
+      properties:
+        text:
+          type: string
+          description: 以空格拼接的 top beam token id（不做反分词）
+        output_ids:
+          type: array
+          items: { type: integer }
+          description: top beam 的 token id（长度为 max_new_tokens）
+        meta_info:
+          type: object
+          properties:
+            completion_tokens:
+              type: integer
+              description: beam_width * max_new_tokens
+            prompt_tokens:
+              type: integer
+              nullable: true
+            finish_reason:
+              type: string
+              example: max_decode_steps
+            request_id:
+              type: string
+            token_ids:
+              type: array
+              items: { type: integer }
+            beam_width:
+              type: integer
+            beam_results:
+              type: array
+              description: 每个 beam 一行，与 SGLang beam search 输出兼容
+              items:
+                type: object
+                properties:
+                  output_ids:
+                    type: array
+                    items: { type: integer }
+                  text:
+                    type: string
+                  meta_info:
+                    type: object
+                    properties:
+                      finish_reason: { type: string }
+                      sequence_score: { type: number }
