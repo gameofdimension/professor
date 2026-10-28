@@ -2,7 +2,7 @@
 
 —— 以 GLM-5.3-Flash 9×H20 全参训练 与 DeepSeek-V4.1-Flash 8×H20 LoRA 两个生产案例为线索
 
-> 调查范围：`/root/automodel`（分支 `dsv41-flash-dev`），参考官方文档
+> 调查范围：NeMo AutoModel 仓库工作副本，参考官方文档
 > [DeepSeek-V4.1-Flash model-coverage](https://docs.nvidia.com/nemo/automodel/latest/model-coverage/large-language-models/deepseek-ai/DeepSeek-V4.1-Flash)
 > 与 [GLM-5.3-Flash model-coverage](https://docs.nvidia.com/nemo/automodel/model-coverage/vision-language-models/thudm/GLM-5.3-Flash)。
 
@@ -107,7 +107,7 @@ backend:
 
 ### 1.7 权重转换与量化解码：state_dict_adapter
 
-每个自定义模型配 `state_dict_adapter.py`，承担 HF↔native 的 key 重映射、张量布局转换和**加载期反量化**。两个案例的 checkpoint 都是量化发布（GLM: FP8 128×128 块；DSv41: FP8 dense 32×32 块 / FP4 experts / FP8 Engram），`dequantize_base_checkpoint: true` 使 adapter 在加载时解码为 BF16 训练。`cpu_dequant` 开关（commit 19f84aca）把反量化搬到主机内存，消除小 world 拓扑下 FP8 shard 与 BF16 解码结果在 GPU 双驻的加载期峰值。
+每个自定义模型配 `state_dict_adapter.py`，承担 HF↔native 的 key 重映射、张量布局转换和**加载期反量化**。两个案例的 checkpoint 都是量化发布（GLM: FP8 128×128 块；DSv41: FP8 dense 32×32 块 / FP4 experts / FP8 Engram），`dequantize_base_checkpoint: true` 使 adapter 在加载时解码为 BF16 训练。
 
 ### 1.8 Checkpoint 双轨制
 
@@ -201,7 +201,7 @@ for batches in step_scheduler:            # 4 个 microbatch
 
 注意 `defer_fsdp_grad_sync: false`（与官方一致）：每个 microbatch 后即 reduce-scatter 并 reshard，**避免跨 4 个累积步保留全量梯度副本**——GLM 案例的显存关键取舍。
 
-**Checkpoint**：DCP 分片 safetensors + `cpu_offload: true`（先搬 CPU 再写盘，规避本镜像 torch nv26.06 在 `tensor.to("cpu", non_blocking=True)` 的 `CUDA error: invalid argument`——官方 recipe `enabled:false` 从未走过的路径，lab 实测发现并修复）；结束时 consolidated 导出 HF 权重。容量：全量模型单次保存 ≈1.9TB（BF16 模型 ~640GB + AdamW 态 ~1.27TB，按 17.5B mini 实测 96GB 外推）。
+**Checkpoint**：DCP 分片 safetensors + `cpu_offload: true`（先搬 CPU 再写盘，规避本集群定制镜像的 torch 在 `tensor.to("cpu", non_blocking=True)` 处的 `CUDA error: invalid argument`——官方 recipe `enabled:false` 从未走过的路径，lab 实测发现并修复）；结束时 consolidated 导出 HF 权重。容量：全量模型单次保存 ≈1.9TB（BF16 模型 ~640GB + AdamW 态 ~1.27TB，按 17.5B mini 实测 96GB 外推）。
 
 ### 2.7 与官方 recipe 的差异（diff 验证）
 
@@ -223,14 +223,14 @@ for batches in step_scheduler:            # 4 个 microbatch
 ### 3.1 命令与脚本层
 
 ```
-CKPT_SAVE_OPTIM=false TB_LOGDIR=$TENSORBOARD_LOG_DIR MODEL=…/DeepSeek-V4.1-Flash-1017/v1 \
-DATASET=…/hellaswag CKPT_DIR=$DATA_OUTPUT_DIR DISPATCHER=torch bash lab/h20_dsv41_lora.sh
+CKPT_SAVE_OPTIM=false TB_LOGDIR=<tb 日志目录> MODEL=…/DeepSeek-V4.1-Flash \
+DATASET=…/hellaswag CKPT_DIR=<输出目录> DISPATCHER=torch bash lab/h20_dsv41_lora.sh
 ```
 
 相对 GLM 启动器，DSv41 版增加三类生产防御：
 
 - **离线开关**：`HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE/HF_DATASETS_OFFLINE=1`（杜绝 Hub 访问超时卡死）；
-- **依赖钉版对齐**：本分支要求 `transformers==5.18.0`（`resolve_revision`）与 `huggingface_hub==1.33.0`（`ResolvedRevision`），从内网镜像对齐并做导入自检；`torchao` 是 `auto_model.py` 顶层硬依赖，只校验不自动装（PyPI 预编译 wheel 与镜像定制 torch 可能不兼容）；
+- **依赖钉版对齐**：当前代码要求 `transformers==5.18.0`（`resolve_revision`）与 `huggingface_hub==1.33.0`（`ResolvedRevision`），从内部镜像源对齐并做导入自检；`torchao` 是 `auto_model.py` 顶层硬依赖，只校验不自动装（PyPI 预编译 wheel 与镜像定制 torch 可能不兼容）；
 - **物料前置校验**：`MODEL/config.json` 与 `DATASET/data/*.parquet` 在 torchrun 之前检查——路径错误在 shell 层暴露一次，而不是 64 个 rank 各报一次。
 
 另有 DSv41 特有环境：`NCCL_PXN_DISABLE=1`（多节点 IB 上 PXN 退化路径的 all-to-all 字节偏移 bug，官方 H100 段落明确要求）、`TILELANG_CACHE_DIR` 指向节点本地 `/tmp`（tilelang 按 shape JIT 编译，缓存落在共享 home 会跨节点竞争，且大 cache 目录引发 NCCL 超时）。**每个 rank 首步触发 JIT 编译、之后读缓存，第一步显著偏慢属预期。**
@@ -257,7 +257,7 @@ model:
 
 `vision_config.num_hidden_layers: 0` 使 `DeepseekV41Model` 跳过 vision/aligner 构建（`model.py:305-311`）——同一模型类服务纯文本训练。`load_base_model: true` + meta 初始化后由基础设施阶段加载。
 
-**量化解码**（`DeepseekV41StateDictAdapter`，`state_dict_adapter.py:243`）：dense 投影 FP8 E4M3 + 32×32 块 e8m0 scale；路由专家 FP4 E2M1（两个打包进 int8）；Engram 表 FP8。`from_hf` 丢弃 mtp.*/未建层/非本 rank 专家 → 逐张量 `dequantize_checkpoint_weight` 解码 BF16 → Engram 行 padding 对齐 owner 数。`cpu_dequant: false`（WORLD=64 下加载期峰值可容；4 节点 WORLD=32 时必需开启）。
+**量化解码**（`DeepseekV41StateDictAdapter`，`state_dict_adapter.py:243`）：dense 投影 FP8 E4M3 + 32×32 块 e8m0 scale；路由专家 FP4 E2M1（两个打包进 int8）；Engram 表 FP8。`from_hf` 丢弃 mtp.*/未建层/非本 rank 专家 → 逐张量 `dequantize_checkpoint_weight` 解码 BF16 → Engram 行 padding 对齐 owner 数。
 
 ### 3.4 LoRA 注入（本案例核心差异点）
 
@@ -304,7 +304,7 @@ model:
 |---|---|---|
 | 模型/数据 | `deepseek-ai/DeepSeek-V4.1-Flash`（Hub + revision pin） | 本地路径，revision 渲染为 **null**（本地快照的正确取值） |
 | checkpoint | `enabled: false` | `enabled: true`；`save_optimizer` 默认 true，**本次 false** |
-| 新增字段 | — | `cpu_offload`/`save_optimizer`/`cpu_dequant` 注释化开关 |
+| 新增字段 | — | `cpu_offload`/`save_optimizer` 注释化开关 |
 | ci: 段 | 有（NCCL_PXN_DISABLE 等） | 移除，改由启动器 export |
 | dispatcher | hybridep | 本次 `DISPATCHER=torch` |
 | 拓扑/超参 | EP32+ep_shard2/GBS64/100 步/LoRA r8 α32 | **完全一致** |
@@ -335,7 +335,7 @@ model:
 | **模型入口** | `NeMoAutoModelForImageTextToText.from_pretrained`，路径直挂 `model.*` | `NeMoAutoModelForCausalLM.from_config` + 嵌套 `DeepseekV41Config.from_pretrained`；`vision_config.num_hidden_layers: 0` 声明式关视觉塔 |
 | **拓扑** | WORLD=72，EP72（ep_shard=1，**4 专家/卡**），**CP2** → DP36 | WORLD=64，EP32 + **派生 ep_shard=2**（12 专家/rank 再对半，冻结基模 ~23GB/卡），CP1 → DP64 |
 | **FSDP mesh** | FSDP 切 `dp_shard_cp` 复合轴（**CP rank 即 DP shard rank，参数按 CP 维再切**）+ unused-param reduce-scatter | FSDP 切 `dp` 轴；专家额外在 `moe_mesh[("ep_shard",)]` 上 Shard(1) 二次分片 |
-| **量化解码** | FP8 dense 128×128 块（e4m3 + `weight_scale_inv`） | FP8 dense 32×32 块 + **FP4 experts**（int8 打包 nibble）+ **FP8 Engram 表**；`cpu_dequant` 开关可用（本次 false，WORLD=32 时必需） |
+| **量化解码** | FP8 dense 128×128 块（e4m3 + `weight_scale_inv`） | FP8 dense 32×32 块 + **FP4 experts**（int8 打包 nibble）+ **FP8 Engram 表** |
 | **PEFT** | 无 | LoRA r8/α32 注入 5 类目标（`attn.wq_a/wq_b/wkv/wo_b` + `ffn.experts`），**shard 前 monkey-patch 改 `__class__`**，MoE 走 `GroupedExpertsLoRA` |
 | **冻结策略** | `freeze_config` 冻结 vision/audio tower，语言模型**全参训练** | 基模 552B **全冻结**，trainability 靠 `"lora_" in name` 参数名约定 |
 | **注意力后端** | cudnn：FlashMLA 前向 + cuDNN Frontend 反向（DSA 层）；KDA 层固定 FLA | tilelang：按 shape JIT 稀疏核（**每 rank 首步编译、显著偏慢属预期**），indexer 打分亦有 tilelang 融合核 |
@@ -350,7 +350,7 @@ model:
 | **mp_policy** | 默认（无显式块） | 显式 `param_dtype: bf16, reduce_dtype: fp32`（单遍 mHC 的 fp32 系数跨 FSDP 边界保 cast） |
 | **prewarm** | 无 | `cublas_backward + comm_groups`（分配器池尚小时预建，避第 1 步峰值 JIT） |
 | **验证** | 无（`val_every: 1000` > max_steps 100） | 每 50 步 HellaSwag validation（`_run_validation_epoch`） |
-| **checkpoint 保存** | **DCP 全量**：分片 safetensors（单次 ≈1.9TB，模型 ~640GB + AdamW 态 ~1.27TB）+ `cpu_offload: true`（规避 torch nv26.06 `CUDA error: invalid argument`）+ 结束 consolidated 导出 HF 权重 | **adapter 旁路**：rank0 单卡写 `model/adapter_model.safetensors` + HF 格式 `adapter_config.json` + tokenizer；本次 `CKPT_SAVE_OPTIM=false` 跳过优化器态（MB 级产物） |
+| **checkpoint 保存** | **DCP 全量**：分片 safetensors（单次 ≈1.9TB，模型 ~640GB + AdamW 态 ~1.27TB）+ `cpu_offload: true`（规避定制镜像 torch 的 `CUDA error: invalid argument`）+ 结束 consolidated 导出 HF 权重 | **adapter 旁路**：rank0 单卡写 `model/adapter_model.safetensors` + HF 格式 `adapter_config.json` + tokenizer；本次 `CKPT_SAVE_OPTIM=false` 跳过优化器态（MB 级产物） |
 | **官方参照（H100）** | loss@step99≈1.23，峰值 57.7 GiB/卡，cudnn 9,489 TPS（sdpa 8,378） | train 2.2655 / val 2.5737，峰值 43.9 GiB/卡 |
 
 ### 4.3 差异的根源解读
@@ -374,7 +374,7 @@ model:
 
 ### 5.2 运行时差异提示
 
-两次实际运行均使用 `DISPATCHER=torch`（官方验证拓扑为 hybridep/DeepEP）。机制上等价（`GroupedExperts` 的 DTensor all-gather/reduce-scatter 路径），正确性已由跑通验证，但专家 token 分发通信效率低于 DeepEP 的 nvshmem 内核——若后续追求官方参照吞吐（GLM cudnn 9,489 TPS / DSv43 43.9GiB 峰值同水平），且镜像内 deep_ep 可用（`lab/Dockerfile.h20` 已固化），可尝试切回 `DISPATCHER=hybridep`。
+两次实际运行均使用 `DISPATCHER=torch`（官方验证拓扑为 hybridep/DeepEP）。机制上等价（`GroupedExperts` 的 DTensor all-gather/reduce-scatter 路径），正确性已由跑通验证，但专家 token 分发通信效率低于 DeepEP 的 nvshmem 内核——若后续追求官方参照吞吐（GLM cudnn 9,489 TPS / DSv41 43.9GiB 峰值同水平），且镜像内 deep_ep 可用（`lab/Dockerfile.h20` 已固化），可尝试切回 `DISPATCHER=hybridep`。
 
 ### 5.3 参照指标（官方 H100 实测，供 H20 结果对照）
 
